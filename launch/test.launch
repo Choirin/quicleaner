@@ -1,0 +1,5 @@
+<launch>
+  <include file="$(find gscam)/examples/v4l_rpi.launch" />
+
+  <node pkg="quicleaner" type="topic_streamer.py" name="topic_streamer" />
+</launch>
