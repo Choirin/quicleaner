@@ -5,29 +5,11 @@ import serial
 import time
 import threading
 import Queue
-
 import ctypes
+import tf
+import math
 
-"""
-typedef struct{
-  uint8_t  marker[2];           //  2 bytes: 0xFF, 0xAB
-  uint8_t  size;                //  1 bytes
-  uint8_t  reserved;            //  1 bytes
-  TWIST    twist;               //  8 bytes
-  uint8_t  sum;                 //  1 bytes
-  uint8_t  reserved2[3];        //  3 bytes
-}PACKET_TWIST_COMMAND;
-"""
-class PacketTwistCommand(ctypes.Structure):
-    _fields_ = (
-        ('marker'     , ctypes.c_uint8 * 2),
-        ('size'       , ctypes.c_uint8),
-        ('reserved'   , ctypes.c_uint8),
-        ('tw_linear'  , ctypes.c_float),
-        ('tw_angular' , ctypes.c_float),
-        ('sum'        , ctypes.c_uint8),
-        ('reserved2'  , ctypes.c_uint8 * 3),
-    )
+from packet import (PacketTwistCommand, PacketSpeed, PacketSensor, PacketTwist)
 
 class SerCom:
     def __init__(self, tty, baud='115200'):
@@ -40,11 +22,28 @@ class SerCom:
 
     def recv_(self):
         while not self.event.is_set():
-            c = self.ser.read(1)
-            if len(c) < 1:
+            delimiter = self.ser.read(1)
+            if len(delimiter) < 1 or delimiter != b'\xff':
                 continue
-            #print('{:02x}'.format(ord(c)))
-            #self.queue.put(line)
+            header = self.ser.read(2)
+            if len(header) < 2:
+                continue
+            type_ = header[0]
+            size = ord(header[1])
+            data = self.ser.read(size - 3)
+            if len(data) < size - 3:
+                continue
+            data = delimiter + header + data
+            if type_ == b'\xac':
+                speed = PacketSpeed.from_buffer_copy(data)
+                self.queue.put(speed)
+            elif type_ == b'\xad':
+                sensor = PacketSensor.from_buffer_copy(data)
+                self.queue.put(sensor)
+            elif type_ == b'\xae':
+                twist = PacketTwist.from_buffer_copy(data)
+                self.queue.put(twist)
+            # hexstr = ['{:02x}'.format(ord(c)) for c in data]
 
     def send(self, data):
         self.ser.write(data)
@@ -71,6 +70,55 @@ class TopicStreamer:
         packet.tw_angular = ctypes.c_float(msg.twist.angular.z)
         self.ser.send(packet)
 
+    def publish_speed(self, struct):
+        print('{}, {}'.format(struct.speed[0], struct.speed[1]))
+
+    def publish_sensor(self, struct):
+        print('{}, {}, {}, {}, {}, {}'.format( \
+                struct.value[0], \
+                struct.value[1], \
+                struct.value[2], \
+                struct.value[3], \
+                struct.value[4], \
+                struct.value[5]))
+
+    def publish_twist(self, struct):
+        print('{}, {}'.format(struct.tw_linear, struct.tw_angular))
+        twist = geometry_msgs.msg.TwistStamped()
+        twist.header.stamp = rospy.Time.now()
+        twist.header.frame_id = 'odom'
+        twist.twist.linear.x = struct.tw_linear
+        twist.twist.angular.z = struct.tw_angular
+        self.pub_speed.publish(twist)
+
+        self.accumulate_odom(struct.tw_linear, struct.tw_angular)
+        self.broadcast_odom()
+
+    prev_time = 0
+    theta = 0
+    x, y = 0, 0
+
+    def accumulate_odom(self, linear_x, angular_z):
+        time = rospy.Time.now().to_sec()
+        if self.prev_time == 0:
+            self.prev_time = time
+            return
+        dt = time - self.prev_time
+        if dt < 0:
+            return
+        self.theta += dt * angular_z
+        self.x += dt * linear_x * math.cos(self.theta)
+        self.y += dt * linear_x * math.sin(self.theta)
+        self.prev_time = time
+
+    def broadcast_odom(self):
+        br = tf.TransformBroadcaster()
+        br.sendTransform((self.x, self.y, 0),
+                    tf.transformations.quaternion_from_euler(0, 0, self.theta),
+                    rospy.Time.now(),
+                    "base_link",
+                    "odom")
+
     def run(self):
         r = rospy.Rate(5)
         while not rospy.is_shutdown():
@@ -79,6 +127,14 @@ class TopicStreamer:
             twist.twist.linear.x = 0.05
             twist.twist.angular.z = 0.0
             #self.pub_test.publish(twist)
+            if not self.ser.queue.empty():
+                struct = self.ser.queue.get()
+                if type(struct) is PacketSpeed:
+                    self.publish_speed(struct)
+                elif type(struct) is PacketSensor:
+                    self.publish_sensor(struct)
+                elif type(struct) is PacketTwist:
+                    self.publish_twist(struct)
             r.sleep()
         self.ser.stop()
 
